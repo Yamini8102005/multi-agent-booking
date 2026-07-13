@@ -3,7 +3,29 @@
 An advanced, production-ready multi-agent scheduling assistant built with **LangGraph**, **LangChain**, **Streamlit**, and **Google Gemini**. It enables natural language appointment scheduling, validates date and time parameters, persists conversation context across restarts, and simulates background notifications.
 
 ---
+## 🚀 Live Demo
 
+The application is deployed and available here:
+
+🔗 https://multi-agent-booking.onrender.com
+
+### How to Test:
+1. Open the live application.
+2. Enter Gemini API key in the sidebar if required.
+3. Try sample booking requests:
+
+Examples:
+- "Hello, how are you today?"
+- "Book tomorrow at 5 PM"
+- "Schedule an appointment on Friday"
+- "Book a meeting and send confirmation"
+
+The application supports:
+- Multi-agent routing using LangGraph
+- Calendar booking workflow
+- Slot availability checking
+- Mock notification triggering
+- Persistent conversation memory
 ## Project Overview
 
 The **Multi-Agent Scheduling Assistant** coordinates scheduling tasks by routing user requests to specialized agents:
