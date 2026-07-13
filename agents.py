@@ -343,6 +343,9 @@ def booking_specialist(state: AgentState) -> AgentState:
     if context.get("completed"):
         context.clear()
 
+    # Ensure booking is tracked as active
+    context["is_active_booking"] = True
+
     extracted = _extract_booking_fields(latest_message)
     
     if extracted.get("date"):
