@@ -57,8 +57,9 @@ def _create_checkpointer() -> SqliteSaver:
     """Create a SQLite-backed checkpointer compatible with the installed LangGraph release."""
     db_path = str(MEMORY_DB_PATH)
     try:
-        connection = sqlite3.connect(db_path, check_same_thread=False)
-        connection.execute("PRAGMA journal_mode=WAL;")
+        # Avoid WAL mode to prevent shared memory/mmap limitations on Render's container overlayfs.
+        # Add timeout to handle concurrent accesses gracefully.
+        connection = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
         return SqliteSaver(connection)
     except Exception as exc:  # pragma: no cover - environment dependent
         logger.exception("Failed to initialize SQLite checkpoint saver")
