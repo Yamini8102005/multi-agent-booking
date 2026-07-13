@@ -51,7 +51,10 @@ def reserve_slot(date: str, time: str, email: str) -> Dict[str, Any]:
         }
     except ValueError as exc:
         logger.warning("Reservation rejected: %s", exc)
-        return {"success": False, "message": str(exc)}
+        msg = str(exc)
+        if "already booked" in msg.lower():
+            msg = "Requested slot is already booked."
+        return {"success": False, "message": msg}
     except RuntimeError as exc:
         logger.exception("Reservation failed")
         return {"success": False, "message": str(exc)}

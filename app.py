@@ -42,10 +42,31 @@ def _initialize_session_state() -> None:
             graph_messages = graph_state.values.get("messages", [])
             st_messages = []
             for msg in graph_messages:
-                if isinstance(msg, HumanMessage) or getattr(msg, "type", None) == "human":
-                    st_messages.append({"role": "user", "content": msg.content})
-                elif isinstance(msg, AIMessage) or getattr(msg, "type", None) == "ai":
-                    st_messages.append({"role": "assistant", "content": msg.content})
+                content = ""
+                msg_type = ""
+                
+                # Extract content
+                if hasattr(msg, "content"):
+                    content = msg.content
+                elif isinstance(msg, dict):
+                    content = msg.get("content", "")
+                elif isinstance(msg, tuple) and len(msg) == 2:
+                    content = msg[1]
+
+                # Extract msg_type
+                if hasattr(msg, "type"):
+                    msg_type = msg.type
+                elif isinstance(msg, dict):
+                    msg_type = msg.get("type") or msg.get("role")
+                elif isinstance(msg, tuple) and len(msg) == 2:
+                    msg_type = msg[0]
+
+                msg_type = str(msg_type).lower() if msg_type else ""
+
+                if msg_type in ("human", "user"):
+                    st_messages.append({"role": "user", "content": content})
+                elif msg_type in ("ai", "assistant", "model", "system"):
+                    st_messages.append({"role": "assistant", "content": content})
             st.session_state.messages = st_messages
         except Exception:
             st.session_state.messages = []
@@ -57,7 +78,16 @@ def _render_sidebar() -> None:
         st.title("Booking Assistant")
         st.caption("Multi-agent appointment booking experience")
 
-        st.text_input("Google API Key", value=os.getenv("GOOGLE_API_KEY", ""), type="password", disabled=True)
+        # Dynamic Google API Key input
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
+        if "google_api_key" not in st.session_state:
+            st.session_state.google_api_key = api_key
+            
+        user_key = st.text_input("Google API Key", value=st.session_state.google_api_key, type="password")
+        if user_key != st.session_state.google_api_key:
+            st.session_state.google_api_key = user_key
+            os.environ["GOOGLE_API_KEY"] = user_key
+            os.environ["GEMINI_API_KEY"] = user_key
 
         if st.button("New Conversation", use_container_width=True):
             new_id = str(uuid.uuid4())

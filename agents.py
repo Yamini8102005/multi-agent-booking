@@ -46,13 +46,29 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def merge_booking_context(left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge two booking contexts. If right is None or contains a clear signal, reset."""
+    if left is None:
+        left = {}
+    if right is None:
+        return left
+    if right.get("_clear"):
+        new_dict = {k: v for k, v in right.items() if k != "_clear"}
+        return new_dict
+    merged = dict(left)
+    for k, v in right.items():
+        if v is not None and str(v).strip() != "":
+            merged[k] = v
+    return merged
+
+
 class AgentState(TypedDict, total=False):
     """State carried through the LangGraph workflow."""
 
     messages: Annotated[List[BaseMessage], add_messages]
     intent: str
     route_to: str
-    booking_context: Dict[str, Any]
+    booking_context: Annotated[Dict[str, Any], merge_booking_context]
     last_response: str
     thread_id: str
 
@@ -119,10 +135,11 @@ def _extract_booking_fields(text: str) -> Dict[str, str]:
     lower_text = text.lower()
 
     # 1. Date extraction
-    match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    match = re.search(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", text)
     if match:
         extracted["date"] = match.group(0)
     else:
+        found_keyword = False
         for keyword in (
             "today",
             "tomorrow",
@@ -133,10 +150,24 @@ def _extract_booking_fields(text: str) -> Dict[str, str]:
             "next friday",
             "next saturday",
             "next sunday",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
         ):
-            if keyword in lower_text:
+            if re.search(rf"\b{keyword}\b", lower_text):
                 extracted["date"] = keyword
+                found_keyword = True
                 break
+        if not found_keyword:
+            on_match = re.search(r"\b(?:on|for|date)\s+([A-Za-z0-9_\-/]+)\b", text, re.IGNORECASE)
+            if on_match:
+                candidate = on_match.group(1).strip()
+                if candidate.lower() not in ("the", "a", "an", "at", "my"):
+                    extracted["date"] = candidate
 
     # 2. Email extraction
     email_match = re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text)
@@ -149,13 +180,22 @@ def _extract_booking_fields(text: str) -> Dict[str, str]:
         temp_text = temp_text.replace(match.group(0), "")
     for keyword in (
         "today", "tomorrow", "next monday", "next tuesday", "next wednesday",
-        "next thursday", "next friday", "next saturday", "next sunday"
+        "next thursday", "next friday", "next saturday", "next sunday",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
     ):
         temp_text = re.sub(rf"\b{keyword}\b", "", temp_text, flags=re.IGNORECASE)
     if email_match:
         temp_text = temp_text.replace(email_match.group(0), "")
 
-    time_match = re.search(r"\b(\d{1,2}(?::\d{2})?(?:am|pm)?)\b", temp_text, re.IGNORECASE)
+    # Match time with spaces e.g. "5 PM" or "10:30 am"
+    time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", temp_text, re.IGNORECASE)
+    if not time_match:
+        # Fallback to hh:mm
+        time_match = re.search(r"\b(\d{1,2}:\d{2})\b", temp_text)
+    if not time_match:
+        # Fallback to hh prefixed by at
+        time_match = re.search(r"\b(?:at|around|slot)\s+(\d{1,2})\b", temp_text, re.IGNORECASE)
+
     if time_match:
         extracted["time"] = time_match.group(1)
 
@@ -163,19 +203,23 @@ def _extract_booking_fields(text: str) -> Dict[str, str]:
 
 
 def _normalize_relative_date(value: str, reference_date: Optional[datetime] = None) -> str:
-    """Normalize common relative date phrases such as today, tomorrow, and next Monday."""
+    """Normalize common relative date phrases such as today, tomorrow, weekdays, and 'next <weekday>'."""
     if not value:
         raise ValueError("Date is required")
 
     text = str(value).strip().lower()
     base_date = (reference_date or datetime.now()).date()
+    normalized_str = None
+    
+    # 1. Handle today
     if text == "today":
-        return base_date.strftime("%Y-%m-%d")
-    if text == "tomorrow":
-        return (base_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        normalized_str = base_date.strftime("%Y-%m-%d")
+        
+    # 2. Handle tomorrow
+    elif text == "tomorrow":
+        normalized_str = (base_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    if text.startswith("next "):
-        weekday_name = text[5:].strip()
+    else:
         weekday_map = {
             "monday": 0,
             "tuesday": 1,
@@ -185,19 +229,38 @@ def _normalize_relative_date(value: str, reference_date: Optional[datetime] = No
             "saturday": 5,
             "sunday": 6,
         }
-        if weekday_name in weekday_map:
-            current_weekday = base_date.weekday()
-            target_weekday = weekday_map[weekday_name]
-            delta = (target_weekday - current_weekday) % 7
-            if delta == 0:
-                delta = 7
-            return (base_date + timedelta(days=delta)).strftime("%Y-%m-%d")
 
-    try:
-        parsed = dateutil_parser.parse(text, fuzzy=True)
-        return parsed.date().strftime("%Y-%m-%d")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("I could not understand the requested date") from exc
+        # 3. Handle next <weekday>
+        if text.startswith("next "):
+            weekday_name = text[5:].strip()
+            if weekday_name in weekday_map:
+                current_weekday = base_date.weekday()
+                target_weekday = weekday_map[weekday_name]
+                delta = (target_weekday - current_weekday) % 7
+                # "next <weekday>" implies next week's weekday
+                normalized_str = (base_date + timedelta(days=delta + 7)).strftime("%Y-%m-%d")
+
+        # 4. Handle plain weekday name (e.g. "Friday")
+        elif text in weekday_map:
+            current_weekday = base_date.weekday()
+            target_weekday = weekday_map[text]
+            delta = (target_weekday - current_weekday) % 7
+            normalized_str = (base_date + timedelta(days=delta)).strftime("%Y-%m-%d")
+
+    # 5. Fallback to parsing absolute dates
+    if not normalized_str:
+        try:
+            parsed = dateutil_parser.parse(text, fuzzy=True)
+            normalized_str = parsed.date().strftime("%Y-%m-%d")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("I could not understand the requested date") from exc
+
+    # Validate that date is not in the past
+    parsed_date = datetime.strptime(normalized_str, "%Y-%m-%d").date()
+    if parsed_date < base_date:
+        raise ValueError("Date cannot be in the past")
+        
+    return normalized_str
 
 
 def _normalize_time(value: str) -> str:
@@ -265,6 +328,22 @@ def _normalize_email(value: str) -> str:
     return cleaned
 
 
+def clean_json_text(text: str) -> str:
+    """Clean markdown code blocks and sanitize text for JSON parsing."""
+    text = text.strip()
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        if match:
+            text = match.group(1).strip()
+        else:
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if json_match:
+        text = json_match.group(0)
+    return text.strip()
+
+
 def triage_agent(state: AgentState) -> AgentState:
     """Classify the user's intent and decide whether to hand off to the booking specialist."""
     messages = state.get("messages") or []
@@ -275,18 +354,26 @@ def triage_agent(state: AgentState) -> AgentState:
     is_active_booking = bool(context) and not context.get("completed")
 
     decision = TriageDecision(intent="general", route_to="end", response="How can I help you today?")
+    
+    normalized = latest_message.lower()
+    
     booking_keywords = {
         "book",
         "booking",
         "appointment",
         "schedule",
         "slot",
+        "slots",
         "reserve",
+        "reservation",
         "meeting",
         "availability",
         "available",
+    }
+    has_booking_word = any(re.search(rf"\b{kw}\b", normalized) for kw in booking_keywords)
+
+    temporal_keywords = {
         "tomorrow",
-        "today",
         "monday",
         "tuesday",
         "wednesday",
@@ -295,9 +382,17 @@ def triage_agent(state: AgentState) -> AgentState:
         "saturday",
         "sunday",
     }
+    has_temporal = any(re.search(rf"\b{kw}\b", normalized) for kw in temporal_keywords)
+    
+    has_today = re.search(r"\btoday\b", normalized)
+    is_greeting = re.search(r"\b(hello|hi|hey|how\s+are\s+you|how\s+is\s+your\s+day|good\s+morning|good\s+afternoon|good\s+evening)\b", normalized)
+    
+    if has_today and is_greeting:
+        has_today = False
+        
+    is_booking_heuristic = is_active_booking or has_booking_word or (has_temporal and not is_greeting) or (has_today and not is_greeting)
 
-    normalized = latest_message.lower()
-    if is_active_booking or any(keyword in normalized for keyword in booking_keywords):
+    if is_booking_heuristic:
         decision = TriageDecision(
             intent="booking",
             route_to="booking_specialist",
@@ -312,14 +407,13 @@ def triage_agent(state: AgentState) -> AgentState:
                     HumanMessage(content=latest_message),
                 ]
             )
-            payload = str(response.content).strip()
-            if payload.startswith("{"):
-                try:
-                    parsed = json.loads(payload)
-                    decision = TriageDecision(**parsed)
-                except Exception as exc:  # pragma: no cover - model output dependent
-                    logger.warning("Unable to parse triage JSON: %s", exc)
-        except Exception as exc:  # pragma: no cover - LLM-dependent path
+            payload = clean_json_text(str(response.content))
+            try:
+                parsed = json.loads(payload)
+                decision = TriageDecision(**parsed)
+            except Exception as exc:
+                logger.warning("Unable to parse triage JSON: %s. Payload was: %s", exc, payload)
+        except Exception as exc:
             logger.warning("Falling back to heuristic triage: %s", exc)
 
     if is_active_booking:
@@ -341,13 +435,66 @@ def booking_specialist(state: AgentState) -> AgentState:
     context: Dict[str, Any] = dict(state.get("booking_context") or {})
 
     if context.get("completed"):
-        context.clear()
+        context = {"_clear": True, "is_active_booking": True}
+    else:
+        # Ensure booking is tracked as active
+        context["is_active_booking"] = True
 
-    # Ensure booking is tracked as active
-    context["is_active_booking"] = True
+    # 1. Extraction phase
+    extracted: Dict[str, str] = {}
+    llm = _create_llm()
+    if llm is not None:
+        collected_info = []
+        if context.get("date"):
+            collected_info.append(f"Date: {context['date']}")
+        if context.get("time"):
+            collected_info.append(f"Time: {context['time']}")
+        if context.get("email"):
+            collected_info.append(f"Email: {context['email']}")
+        
+        info_str = "\n".join(collected_info) if collected_info else "None"
+        
+        extraction_prompt = (
+            "You are an information extraction assistant for an appointment booking system.\n"
+            f"Currently collected details:\n{info_str}\n\n"
+            "Analyze the conversation history and the latest user message. Extract any newly provided "
+            "or updated values for 'date', 'time', and 'email'.\n"
+            "Return a JSON object with the keys 'date', 'time', 'email'. Use null for fields "
+            "that are not mentioned or cannot be extracted. Do not overwrite already collected fields "
+            "with null unless the user is explicitly correcting or changing them.\n"
+            "For relative dates like 'tomorrow', 'next Monday', or weekdays like 'Friday', extract the "
+            "literal phrase (e.g. 'tomorrow', 'Friday') as-is. Do not try to convert them into YYYY-MM-DD "
+            "format yourself.\n"
+            "Respond ONLY with the JSON object."
+        )
+        try:
+            llm_messages = [SystemMessage(content=extraction_prompt)]
+            # Add up to 3 context messages
+            for msg in messages[-3:]:
+                llm_messages.append(msg)
+            # Ensure latest message is present
+            if not any(msg.content == latest_message for msg in messages[-3:]):
+                llm_messages.append(HumanMessage(content=latest_message))
+                
+            response = llm.invoke(llm_messages)
+            payload = clean_json_text(str(response.content))
+            try:
+                extracted = json.loads(payload)
+            except Exception as exc:
+                logger.warning("Failed to parse specialist extraction JSON: %s. Payload was: %s", exc, payload)
+                extracted = {}
+        except Exception as exc:
+            logger.warning("LLM extraction failed, falling back to heuristics: %s", exc)
+            extracted = {}
 
-    extracted = _extract_booking_fields(latest_message)
-    
+    # Heuristic fallback/merge
+    heuristic_extracted = _extract_booking_fields(latest_message)
+    for field in ("date", "time", "email"):
+        val = extracted.get(field) or heuristic_extracted.get(field)
+        if val:
+            extracted[field] = val
+
+    # 2. Update context & validation phase
     if extracted.get("date"):
         try:
             normalized_date = _normalize_relative_date(extracted["date"])
@@ -378,6 +525,7 @@ def booking_specialist(state: AgentState) -> AgentState:
             context["email_error"] = str(exc)
             context.pop("email", None)
 
+    # Check for missing/invalid details
     missing_fields: List[str] = []
     if not context.get("date"):
         missing_fields.append("date")
@@ -394,26 +542,87 @@ def booking_specialist(state: AgentState) -> AgentState:
     if context.get("email_error"):
         error_messages.append(f"Email error: {context['email_error']}.")
 
-    if missing_fields or error_messages:
-        if error_messages:
-            err_prompt = " ".join(error_messages)
-            if missing_fields:
-                prompt = f"{err_prompt} Please also provide the missing fields: {', '.join(missing_fields)}."
-            else:
-                prompt = f"{err_prompt} Please correct these details."
+    # If there are parsing/validation errors, report them immediately
+    if error_messages:
+        err_prompt = " ".join(error_messages)
+        if missing_fields:
+            prompt = f"{err_prompt} Please also provide the missing fields: {', '.join(missing_fields)}."
         else:
-            if len(missing_fields) == 1:
-                field = missing_fields[0]
-                if field == "date" and context.get("time") and context.get("email"):
-                    prompt = "Please choose a date for your appointment."
-                elif field == "time" and context.get("date") and context.get("email"):
-                    prompt = f"Please choose a time for your booking on {context['date']}."
-                elif field == "email" and context.get("date") and context.get("time"):
-                    prompt = f"Please provide your email address to confirm the booking on {context['date']} at {context['time']}."
+            prompt = f"{err_prompt} Please correct these details."
+        decision = BookingDecision(status="needs_info", message=prompt, needs_more_info=True)
+        return {
+            "booking_context": context,
+            "last_response": decision.message,
+            "messages": [AIMessage(content=decision.message)],
+        }
+
+    # If date and time are present and valid, check if the slot is available
+    if context.get("date") and context.get("time"):
+        try:
+            availability = tool_check_availability(context["date"])
+            requested_slot = context["time"]
+            availability_status = availability.get(requested_slot, "booked")
+            
+            if availability_status != "available":
+                available_slots = [slot for slot, status in availability.items() if status == "available"]
+                context.pop("pending_tool", None)
+                context.pop("tool_args", None)
+                
+                if available_slots:
+                    msg = (
+                        f"The requested slot is unavailable. Please choose one of the available alternatives: "
+                        f"{', '.join(available_slots)}"
+                    )
                 else:
-                    prompt = f"Please provide the missing {field}."
+                    msg = "No appointment slots are available on that date."
+                
+                decision = BookingDecision(
+                    status="negotiation_required",
+                    message=msg,
+                    date=context["date"],
+                    time=requested_slot,
+                    email=context.get("email"),
+                    available_slots=available_slots,
+                )
+                return {
+                    "booking_context": context,
+                    "last_response": decision.message,
+                    "messages": [AIMessage(content=decision.message)],
+                }
+        except Exception as exc:
+            logger.exception("Availability lookup failed")
+            decision = BookingDecision(status="failed", message=f"I could not check availability right now: {exc}")
+            return {
+                "booking_context": context,
+                "last_response": decision.message,
+                "messages": [AIMessage(content=decision.message)],
+            }
+
+    # If the slot is available but we are missing some other information (e.g. email), ask for it specifically
+    if missing_fields:
+        if len(missing_fields) == 1:
+            field = missing_fields[0]
+            if field == "email":
+                prompt = "Please provide your email address."
+            elif field == "time":
+                prompt = "Please provide the preferred booking time."
+            elif field == "date":
+                prompt = "Please provide the preferred booking date."
             else:
-                prompt = f"Please provide the missing fields: {', '.join(missing_fields)}."
+                prompt = f"Please provide your {field}."
+        else:
+            parts = []
+            if "date" in missing_fields:
+                parts.append("preferred booking date")
+            if "time" in missing_fields:
+                parts.append("preferred booking time")
+            if "email" in missing_fields:
+                parts.append("email address")
+            
+            if len(parts) == 2:
+                prompt = f"Please provide your {parts[0]} and {parts[1]}."
+            else:
+                prompt = f"Please provide your {', '.join(parts[:-1])}, and {parts[-1]}."
 
         decision = BookingDecision(status="needs_info", message=prompt, needs_more_info=True)
         return {
@@ -422,66 +631,17 @@ def booking_specialist(state: AgentState) -> AgentState:
             "messages": [AIMessage(content=decision.message)],
         }
 
-    try:
-        availability = tool_check_availability(context["date"])
-    except Exception as exc:  # pragma: no cover - helper path
-        logger.exception("Availability lookup failed")
-        decision = BookingDecision(status="failed", message=f"I could not check availability right now: {exc}")
-        return {
-            "booking_context": context,
-            "last_response": decision.message,
-            "messages": [AIMessage(content=decision.message)],
-        }
-
+    # All fields are valid and slot is available
     requested_slot = context["time"]
-    availability_status = availability.get(requested_slot, "booked")
-    if availability_status == "available":
-        context["pending_tool"] = "reserve_slot"
-        context["tool_args"] = {
-            "date": context["date"],
-            "time": requested_slot,
-            "email": context["email"],
-        }
-        decision = BookingDecision(
-            status="ready_to_book",
-            message="I’m ready to reserve your requested slot.",
-            date=context["date"],
-            time=requested_slot,
-            email=context["email"],
-        )
-        return {
-            "booking_context": context,
-            "last_response": decision.message,
-            "messages": [AIMessage(content=decision.message)],
-        }
-
-    available_slots = [slot for slot, status in availability.items() if status == "available"]
-    if available_slots:
-        context["pending_tool"] = "negotiate"
-        context["tool_args"] = {
-            "date": context["date"],
-            "available_slots": available_slots,
-        }
-        decision = BookingDecision(
-            status="negotiation_required",
-            message=(
-                "The requested slot is unavailable. Please choose one of the available alternatives: "
-                f"{', '.join(available_slots)}"
-            ),
-            date=context["date"],
-            time=requested_slot,
-            email=context["email"],
-            available_slots=available_slots,
-        )
-        return {
-            "booking_context": context,
-            "last_response": decision.message,
-            "messages": [AIMessage(content=decision.message)],
-        }
-
+    context["pending_tool"] = "reserve_slot"
+    context["tool_args"] = {
+        "date": context["date"],
+        "time": requested_slot,
+        "email": context["email"],
+    }
     decision = BookingDecision(
-        status="failed",
-        message="No appointment slots are available on that date.",
+        status="ready_to_book",
+        message="I’m ready to reserve your requested slot.",
         date=context["date"],
         time=requested_slot,
         email=context["email"],
@@ -494,44 +654,67 @@ def booking_specialist(state: AgentState) -> AgentState:
 
 
 def tool_execution(state: AgentState) -> AgentState:
-    """Execute the relevant tool call for the booking workflow."""
-    messages = state.get("messages") or []
+    """Execute the relevant tool call for the booking workflow with error boundaries."""
     context: Dict[str, Any] = dict(state.get("booking_context") or {})
     action = context.get("pending_tool")
     response_text = state.get("last_response") or "I’m processing the booking request."
 
     if action == "reserve_slot":
         tool_args = context.get("tool_args") or {}
-        reservation_result = tool_reserve_slot(
-            date=tool_args.get("date"),
-            time=tool_args.get("time"),
-            email=tool_args.get("email"),
-        )
-        if reservation_result.get("success"):
-            notification_result = tool_send_booking_notification(
+        
+        try:
+            reservation_result = tool_reserve_slot(
+                date=tool_args.get("date"),
+                time=tool_args.get("time"),
                 email=tool_args.get("email"),
-                details={
-                    "date": tool_args.get("date"),
-                    "time": tool_args.get("time"),
-                    "status": "confirmed",
-                },
             )
+        except Exception as exc:
+            logger.exception("Database reservation failed during tool execution")
+            reservation_result = {"success": False, "message": f"Reservation failed: {exc}"}
+
+        if reservation_result.get("success"):
             response_text = reservation_result.get("message", "Booking completed.")
-            if notification_result.get("status") == "warning":
-                response_text = f"{response_text} Warning: {notification_result.get('message')}"
             
-            context.clear()
-            context["completed"] = True
+            try:
+                notification_result = tool_send_booking_notification(
+                    email=tool_args.get("email"),
+                    details={
+                        "date": tool_args.get("date"),
+                        "time": tool_args.get("time"),
+                        "status": "confirmed",
+                    },
+                )
+                if notification_result.get("status") == "warning":
+                    response_text = f"{response_text} Warning: {notification_result.get('message')}"
+            except Exception as exc:
+                logger.exception("Notification webhook failed during tool execution")
+                response_text = f"{response_text} Warning: Notification could not be delivered: {exc}"
+            
+            # Clear context but set completed flag
+            context = {"completed": True, "_clear": True}
         else:
-            response_text = reservation_result.get("message", "Booking could not be completed.")
+            # Reservation failed (e.g. slot already taken)
+            error_message = reservation_result.get("message", "Booking could not be completed.")
             context.pop("pending_tool", None)
             context.pop("tool_args", None)
-    elif action == "negotiate":
-        available_slots = context.get("tool_args", {}).get("available_slots", [])
-        response_text = (
-            "The requested slot is unavailable. Please choose one of the available alternatives: "
-            f"{', '.join(available_slots)}"
-        )
+            
+            # Let's check available alternatives
+            date_val = tool_args.get("date")
+            alternatives = []
+            if date_val:
+                try:
+                    availability = tool_check_availability(date_val)
+                    alternatives = [slot for slot, status in availability.items() if status == "available"]
+                except Exception as exc:
+                    logger.warning("Failed to check alternatives: %s", exc)
+            
+            if alternatives:
+                response_text = (
+                    f"Reservation failed: {error_message} "
+                    f"Please choose one of the available alternatives: {', '.join(alternatives)}"
+                )
+            else:
+                response_text = f"Reservation failed: {error_message} No other slots are available on this date."
     else:
         response_text = state.get("last_response") or "No action was needed."
 

@@ -11,12 +11,13 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, Annotated
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
-from agents import AgentState, booking_specialist, tool_execution, triage_agent
+from agents import AgentState, booking_specialist, tool_execution, triage_agent, merge_booking_context
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -30,10 +31,10 @@ MEMORY_DB_PATH = DATA_DIR / "memory.db"
 class GraphState(TypedDict, total=False):
     """Graph state alias used by the workflow runtime."""
 
-    messages: list[Any]
+    messages: Annotated[list[Any], add_messages]
     intent: str
     route_to: str
-    booking_context: dict[str, Any]
+    booking_context: Annotated[dict[str, Any], merge_booking_context]
     last_response: str
     thread_id: str
 
